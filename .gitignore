@@ -1,0 +1,8 @@
+/terraform-provider-serverside
+/terraform-provider-serverside.exe
+/dist/
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log

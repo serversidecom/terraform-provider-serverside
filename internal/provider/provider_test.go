@@ -24,11 +24,16 @@ func TestSchemasAreValid(t *testing.T) {
 		t.Errorf("%s: %s: %s", d.Severity, d.Summary, d.Detail)
 	}
 	for _, name := range []string{
-		"serverside_ssh_key", "serverside_firewall_group", "serverside_firewall_group_assignment",
-		"serverside_virtual_network", "serverside_virtual_network_attachment", "serverside_ip_block",
+		"serverside_ssh_key", "serverside_virtual_network", "serverside_virtual_network_attachment", "serverside_ip_block",
 	} {
 		if _, ok := resp.ResourceSchemas[name]; !ok {
 			t.Errorf("resource %s is not registered", name)
+		}
+	}
+	// Firewall groups are not released yet.
+	for _, name := range []string{"serverside_firewall_group", "serverside_firewall_group_assignment"} {
+		if _, ok := resp.ResourceSchemas[name]; ok {
+			t.Errorf("resource %s is registered before firewall groups are released", name)
 		}
 	}
 	for _, name := range []string{

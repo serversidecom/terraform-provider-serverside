@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -47,7 +48,7 @@ func (r *ipBlockResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"usage-based billing entitlement (the API answers 422 USAGE_BILLING_DISABLED without it). Destroying the " +
 			"resource requests cancellation of the block's subscription; an unassigned block is released at once.",
 		Attributes: map[string]schema.Attribute{
-			"id": schema.StringAttribute{Description: "Id of the allocated prefix.", Computed: true, PlanModifiers: keep},
+			"id": schema.StringAttribute{Description: "Id of the IP block.", Computed: true, PlanModifiers: keep},
 			"plan_id": schema.StringAttribute{
 				Description: "IP block plan, from the serverside_ip_block_plans data source. Changing it replaces the block.",
 				Required:    true,
@@ -61,10 +62,10 @@ func (r *ipBlockResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"Replaces the IP block when the plan changes.",
 				)},
 			},
-			"datacenter_id":   schema.StringAttribute{Required: true, PlanModifiers: replace},
+			"datacenter_id":   schema.StringAttribute{Description: "Datacenter from serverside_datacenters, by id or code (such as ams1).", Required: true, PlanModifiers: replace},
 			"network_id":      schema.StringAttribute{Description: "Public virtual network to add the block to.", Required: true, PlanModifiers: replace},
-			"subscription_id": schema.StringAttribute{Computed: true, PlanModifiers: keep},
-			"ip_version":      schema.StringAttribute{Description: "v4 or v6.", Computed: true, PlanModifiers: keep},
+			"subscription_id": schema.StringAttribute{Description: "Subscription that bills the block.", Computed: true, PlanModifiers: keep},
+			"ip_version":      schema.StringAttribute{Description: "V4 or V6.", Computed: true, PlanModifiers: keep},
 			"prefix":          schema.StringAttribute{Description: "The allocated network, for example 198.51.100.0/29.", Computed: true, PlanModifiers: keep},
 			"prefix_length": schema.Int64Attribute{
 				Computed:      true,
@@ -79,33 +80,30 @@ func (r *ipBlockResource) Configure(_ context.Context, req resource.ConfigureReq
 	r.client = clientFromResource(req, resp)
 }
 
-// readPrefix fills the computed attributes. The API has no family-neutral
-// read, so an unknown family tries v4 and then v6.
-func (r *ipBlockResource) readPrefix(ctx context.Context, m *ipBlockModel) error {
-	families := []string{"v4", "v6"}
-	if v := m.IPVersion.ValueString(); v == "v4" || v == "v6" {
-		families = []string{v}
+// setFromBlock fills the attributes the API reports.
+func setFromBlock(m *ipBlockModel, b *client.IPBlock) {
+	m.ID = types.StringValue(b.ID)
+	m.NetworkID = types.StringValue(b.NetworkID)
+	// Keep a datacenter given by its code rather than its id.
+	if dc := m.DatacenterID.ValueString(); dc != b.Datacenter.ID && dc != b.Datacenter.Code {
+		m.DatacenterID = types.StringValue(b.Datacenter.ID)
 	}
-	var lastErr error
-	for _, fam := range families {
-		p, err := r.client.GetPrefix(ctx, m.NetworkID.ValueString(), m.ID.ValueString(), fam)
-		if client.IsNotFound(err) {
-			lastErr = err
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		m.IPVersion = types.StringValue(fam)
-		m.Prefix = types.StringValue(p.Network)
-		m.PrefixLength = types.Int64Value(p.PrefixLength)
-		m.Gateway = types.StringValue(p.Gateway)
-		if p.Datacenter.ID != "" {
-			m.DatacenterID = types.StringValue(p.Datacenter.ID)
-		}
-		return nil
+	m.IPVersion = types.StringValue(b.IPVersion)
+	m.Prefix = types.StringValue(b.CIDR)
+	m.PrefixLength = types.Int64Value(b.PrefixLength)
+	m.Gateway = stringValue(b.Gateway)
+}
+
+// setSubscription looks up the subscription id, which the block itself does
+// not carry. A failure only warns: the block is there either way.
+func (r *ipBlockResource) setSubscription(ctx context.Context, m *ipBlockModel, d *diag.Diagnostics) {
+	sub, err := r.client.GetIPBlockSubscription(ctx, m.ID.ValueString())
+	if err != nil {
+		m.SubscriptionID = types.StringNull()
+		d.AddWarning("Serverside.com API: read IP block subscription", err.Error())
+		return
 	}
-	return lastErr
+	m.SubscriptionID = types.StringValue(sub.ID)
 }
 
 func (r *ipBlockResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -114,7 +112,7 @@ func (r *ipBlockResource) Create(ctx context.Context, req resource.CreateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	created, err := r.client.CreateIPBlock(ctx, plan.PlanID.ValueString(), plan.DatacenterID.ValueString(), plan.NetworkID.ValueString(), client.NewIdempotencyKey())
+	block, err := r.client.CreateIPBlock(ctx, plan.PlanID.ValueString(), plan.DatacenterID.ValueString(), plan.NetworkID.ValueString(), client.NewIdempotencyKey())
 	if err != nil {
 		if client.HasCode(err, "USAGE_BILLING_DISABLED") {
 			resp.Diagnostics.AddError("Hourly billing is not enabled for this organization",
@@ -124,16 +122,8 @@ func (r *ipBlockResource) Create(ctx context.Context, req resource.CreateRequest
 		addAPIError(&resp.Diagnostics, "create IP block", err)
 		return
 	}
-	plan.ID = types.StringValue(created.PrefixID)
-	plan.SubscriptionID = stringValue(created.SubscriptionID)
-	plan.IPVersion = types.StringUnknown()
-	if err := r.readPrefix(ctx, &plan); err != nil {
-		plan.IPVersion, plan.Prefix, plan.Gateway = types.StringNull(), types.StringNull(), types.StringNull()
-		plan.PrefixLength = types.Int64Null()
-		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
-		addAPIError(&resp.Diagnostics, "read new IP block", err)
-		return
-	}
+	setFromBlock(&plan, block)
+	r.setSubscription(ctx, &plan, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -143,7 +133,7 @@ func (r *ipBlockResource) Read(ctx context.Context, req resource.ReadRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	err := r.readPrefix(ctx, &state)
+	block, err := r.client.GetIPBlock(ctx, state.ID.ValueString())
 	if client.IsNotFound(err) {
 		resp.State.RemoveResource(ctx)
 		return
@@ -151,6 +141,10 @@ func (r *ipBlockResource) Read(ctx context.Context, req resource.ReadRequest, re
 	if err != nil {
 		addAPIError(&resp.Diagnostics, "read IP block", err)
 		return
+	}
+	setFromBlock(&state, block)
+	if state.SubscriptionID.IsNull() {
+		r.setSubscription(ctx, &state, &resp.Diagnostics)
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
@@ -178,14 +172,8 @@ func (r *ipBlockResource) Delete(ctx context.Context, req resource.DeleteRequest
 	}
 }
 
-// ImportState takes "<network_id>/<prefix_id>"; plan_id cannot be read back
-// and has to match the configuration.
+// ImportState takes the block id; plan_id cannot be read back and has to
+// match the configuration.
 func (r *ipBlockResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	parts, err := splitID(req.ID, 2)
-	if err != nil {
-		resp.Diagnostics.AddError("Invalid import id", "expected <network_id>/<prefix_id>: "+err.Error())
-		return
-	}
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("network_id"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parts[1])...)
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }

@@ -42,7 +42,7 @@ func (p *serversideProvider) Metadata(_ context.Context, _ provider.MetadataRequ
 
 func (p *serversideProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages Serverside.com bare metal networking, firewall groups and SSH keys through the Serverside.com API.",
+		Description: "Manages Serverside.com bare metal networking and SSH keys through the Serverside.com API.",
 		Attributes: map[string]schema.Attribute{
 			"api_key": schema.StringAttribute{
 				Description: "Organization API key, created in the cloud console at https://cloud.serverside.com. Can also be set with the " + envAPIKey + " environment variable.",
@@ -93,10 +93,10 @@ func (p *serversideProvider) Configure(ctx context.Context, req provider.Configu
 }
 
 func (p *serversideProvider) Resources(_ context.Context) []func() resource.Resource {
+	// NewFirewallGroupResource and NewFirewallGroupAssignmentResource are left
+	// out until firewall groups are released.
 	return []func() resource.Resource{
 		NewSSHKeyResource,
-		NewFirewallGroupResource,
-		NewFirewallGroupAssignmentResource,
 		NewVirtualNetworkResource,
 		NewVirtualNetworkAttachmentResource,
 		NewIPBlockResource,

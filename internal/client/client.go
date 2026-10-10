@@ -1,8 +1,8 @@
 // Package client is a small hand-written client for the Serverside.com API.
 //
-// Every JSON response is wrapped in a ServiceResponse envelope
-// ({success, message, code, errors, traceId, data, pagination}); the client
-// unwraps data and turns error responses into *APIError.
+// Every JSON response is wrapped in an envelope: {success, data, pagination}
+// on success and {success, code, message, traceId, details} on error. The
+// client unwraps data and turns error responses into *APIError.
 package client
 
 import (
@@ -69,19 +69,28 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 // Pagination mirrors the envelope's pagination block.
 type Pagination struct {
 	TotalRecords int `json:"totalRecords"`
-	CurrentPage  int `json:"currentPage"`
+	Page         int `json:"page"`
 	PageSize     int `json:"pageSize"`
 	TotalPages   int `json:"totalPages"`
 }
 
+// ErrorDetail is one entry of an error envelope's details, typically a
+// validation failure on one field.
+type ErrorDetail struct {
+	Code     string  `json:"code"`
+	Message  string  `json:"message"`
+	Field    *string `json:"field"`
+	Location *string `json:"location"`
+}
+
 type envelope struct {
-	Success    bool                `json:"success"`
-	Message    string              `json:"message"`
-	Code       string              `json:"code"`
-	Errors     map[string][]string `json:"errors"`
-	TraceID    string              `json:"traceId"`
-	Data       json.RawMessage     `json:"data"`
-	Pagination *Pagination         `json:"pagination"`
+	Success    bool            `json:"success"`
+	Message    string          `json:"message"`
+	Code       string          `json:"code"`
+	Details    []ErrorDetail   `json:"details"`
+	TraceID    string          `json:"traceId"`
+	Data       json.RawMessage `json:"data"`
+	Pagination *Pagination     `json:"pagination"`
 }
 
 // APIError is a non-2xx response.
@@ -90,7 +99,7 @@ type APIError struct {
 	Code       string
 	Message    string
 	TraceID    string
-	Errors     map[string][]string
+	Details    []ErrorDetail
 	Method     string
 	Path       string
 }
@@ -104,8 +113,12 @@ func (e *APIError) Error() string {
 	if e.Message != "" {
 		fmt.Fprintf(&b, ": %s", e.Message)
 	}
-	for field, msgs := range e.Errors {
-		fmt.Fprintf(&b, "; %s: %s", field, strings.Join(msgs, ", "))
+	for _, d := range e.Details {
+		if d.Field != nil && *d.Field != "" {
+			fmt.Fprintf(&b, "; %s: %s", *d.Field, d.Message)
+		} else {
+			fmt.Fprintf(&b, "; %s", d.Message)
+		}
 	}
 	if e.TraceID != "" {
 		fmt.Fprintf(&b, " (traceId %s)", e.TraceID)
@@ -170,7 +183,7 @@ func (c *Client) do(ctx context.Context, r request, out any) (int, *Pagination, 
 		if err != nil {
 			return 0, nil, err
 		}
-		req.Header.Set("X-API-KEY", c.apiKey)
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", c.userAgent)
 		if payload != nil {
@@ -228,14 +241,14 @@ func (c *Client) do(ctx context.Context, r request, out any) (int, *Pagination, 
 
 func decodeError(resp *http.Response, body []byte, r request) *APIError {
 	apiErr := &APIError{StatusCode: resp.StatusCode, Method: r.method, Path: r.path}
-	// Most errors use the envelope; a few (403 SERVICE_NOT_AVAILABLE) do not,
-	// so decode leniently and fall back to the raw text.
+	// Errors use the envelope, but a proxy in front of the API may answer
+	// with something else, so decode leniently and fall back to the raw text.
 	var env envelope
 	if err := json.Unmarshal(body, &env); err == nil {
 		apiErr.Code = env.Code
 		apiErr.Message = env.Message
 		apiErr.TraceID = env.TraceID
-		apiErr.Errors = env.Errors
+		apiErr.Details = env.Details
 	}
 	if apiErr.Code == "" && apiErr.Message == "" {
 		apiErr.Message = strings.TrimSpace(string(body))
@@ -311,7 +324,7 @@ func listAll[T any](ctx context.Context, c *Client, path string, query url.Value
 			q[k] = v
 		}
 		q.Set("page", strconv.Itoa(page))
-		q.Set("page_size", strconv.Itoa(pageSize))
+		q.Set("pageSize", strconv.Itoa(pageSize))
 		var items []T
 		_, pg, err := c.do(ctx, request{method: http.MethodGet, path: path, query: q}, &items)
 		if err != nil {
